@@ -107,6 +107,16 @@ namespace bmp {
     }
   };
 
+  /**
+   * Connectivity mode used by Bitmap::extract_regions()
+   */
+  enum class Connectivity {
+    Four, /* Only horizontal and vertical neighbors are considered connected */
+    Eight /* Horizontal, vertical and diagonal neighbors are considered connected */
+  };
+
+  struct ConnectedRegion; /* Defined after Bitmap, since it stores a Bitmap crop */
+
   class Bitmap {
   public:
     Bitmap() noexcept : m_pixels(), m_width(0), m_height(0) {
@@ -387,6 +397,27 @@ namespace bmp {
       std::fill(m_pixels.begin(), m_pixels.end(), pixel);
     }
 
+    /**
+     *	Extracts connected foreground regions (e.g. icons on a sprite sheet scan).
+     *
+     *	A binary mask is built by comparing each pixel's luminance (Rec. 601)
+     *	against `threshold` (clamped into [0, 255]; 24bpp bitmaps carry no alpha
+     *	channel, so the threshold applies to luminance only). Pixels with
+     *	luminance >= threshold are foreground when `foreground_is_bright` is
+     *	true, pixels with luminance <= threshold otherwise.
+     *
+     *	Regions are connected using `connectivity` (4- or 8-neighborhood) and
+     *	regions smaller than `min_area` pixels are discarded as noise.
+     *
+     *	The returned regions are in stable scan order (top-to-bottom,
+     *	left-to-right by first discovered pixel). The bitmap itself is not
+     *	modified. An empty bitmap yields an empty result.
+     */
+    [[nodiscard]] std::vector<ConnectedRegion> extract_regions(std::int32_t threshold,
+                                                               Connectivity connectivity = Connectivity::Eight,
+                                                               std::size_t min_area = 1,
+                                                               bool foreground_is_bright = true) const;
+
   public: /* Operators */
     const Pixel &operator[](const std::size_t i) const { return m_pixels[i]; }
 
@@ -654,4 +685,124 @@ namespace bmp {
     std::int32_t m_width;
     std::int32_t m_height;
   };
+
+  /**
+   * A connected foreground region extracted by Bitmap::extract_regions()
+   */
+  struct ConnectedRegion {
+    std::int32_t x = 0;      /* Left coordinate of the bounding box */
+    std::int32_t y = 0;      /* Top coordinate of the bounding box */
+    std::int32_t width = 0;  /* Width of the bounding box */
+    std::int32_t height = 0; /* Height of the bounding box */
+    std::size_t area = 0;    /* Number of foreground pixels belonging to the region */
+    double centroid_x = 0.0; /* X coordinate of the centroid (average of the region pixel x coords) */
+    double centroid_y = 0.0; /* Y coordinate of the centroid (average of the region pixel y coords) */
+    Bitmap crop;             /* Copy of the source pixels inside the bounding box */
+  };
+
+  inline std::vector<ConnectedRegion> Bitmap::extract_regions(const std::int32_t threshold,
+                                                              const Connectivity connectivity,
+                                                              const std::size_t min_area,
+                                                              const bool foreground_is_bright) const {
+    // Empty bitmap: nothing to extract
+    if (m_pixels.empty())
+      return {};
+
+    // Clamp the threshold into the valid [0, 255] luminance range so that
+    // negative or too large thresholds have a well defined behavior
+    const std::int32_t clamped_threshold = std::clamp<std::int32_t>(threshold, 0, 255);
+
+    const std::size_t width = static_cast<std::size_t>(m_width);
+    const std::size_t pixel_count = m_pixels.size();
+
+    // 1) Build the binary foreground mask from per-pixel luminance (Rec. 601)
+    std::vector<bool> mask(pixel_count, false);
+    for (std::size_t i = 0; i < pixel_count; ++i) {
+      const Pixel &p = m_pixels[i];
+      const std::int32_t luminance = (static_cast<std::int32_t>(p.r) * 299 +
+                                      static_cast<std::int32_t>(p.g) * 587 +
+                                      static_cast<std::int32_t>(p.b) * 114) /
+                                     1000;
+      mask[i] = foreground_is_bright ? (luminance >= clamped_threshold) : (luminance <= clamped_threshold);
+    }
+
+    // 2) Label connected regions with an iterative flood fill.
+    //    Pixels are scanned top-to-bottom, left-to-right, so regions are
+    //    discovered (and returned) in a stable, deterministic order.
+    std::vector<bool> visited(pixel_count, false);
+    std::vector<ConnectedRegion> regions;
+    std::vector<std::size_t> stack;
+
+    // Neighbor offsets for 4- and 8-connectivity
+    static constexpr std::int32_t dx4[] = {1, -1, 0, 0};
+    static constexpr std::int32_t dy4[] = {0, 0, 1, -1};
+    static constexpr std::int32_t dx8[] = {1, -1, 0, 0, 1, 1, -1, -1};
+    static constexpr std::int32_t dy8[] = {0, 0, 1, -1, 1, -1, 1, -1};
+    const std::int32_t *dx = (connectivity == Connectivity::Eight) ? dx8 : dx4;
+    const std::int32_t *dy = (connectivity == Connectivity::Eight) ? dy8 : dy4;
+    const std::size_t neighbor_count = (connectivity == Connectivity::Eight) ? 8 : 4;
+
+    for (std::size_t start = 0; start < pixel_count; ++start) {
+      if (!mask[start] || visited[start])
+        continue;
+
+      // Flood fill the region starting at this pixel
+      std::int32_t min_x = m_width, min_y = m_height, max_x = 0, max_y = 0;
+      std::uint64_t sum_x = 0, sum_y = 0; // 64-bit accumulators: no overflow even for huge images
+      std::size_t area = 0;
+
+      stack.clear();
+      stack.push_back(start);
+      visited[start] = true;
+      while (!stack.empty()) {
+        const std::size_t index = stack.back();
+        stack.pop_back();
+        const std::int32_t px = static_cast<std::int32_t>(index % width);
+        const std::int32_t py = static_cast<std::int32_t>(index / width);
+
+        min_x = std::min(min_x, px);
+        min_y = std::min(min_y, py);
+        max_x = std::max(max_x, px);
+        max_y = std::max(max_y, py);
+        sum_x += static_cast<std::uint64_t>(px);
+        sum_y += static_cast<std::uint64_t>(py);
+        ++area;
+
+        for (std::size_t n = 0; n < neighbor_count; ++n) {
+          const std::int32_t nx = px + dx[n];
+          const std::int32_t ny = py + dy[n];
+          if (!in_bounds(nx, ny))
+            continue;
+          const std::size_t n_index = static_cast<std::size_t>(nx) + width * static_cast<std::size_t>(ny);
+          if (mask[n_index] && !visited[n_index]) {
+            visited[n_index] = true;
+            stack.push_back(n_index);
+          }
+        }
+      }
+
+      // 3) Filter out noise: drop regions smaller than min_area
+      if (area < min_area)
+        continue;
+
+      ConnectedRegion region;
+      region.x = min_x;
+      region.y = min_y;
+      region.width = max_x - min_x + 1;
+      region.height = max_y - min_y + 1;
+      region.area = area;
+      region.centroid_x = static_cast<double>(sum_x) / static_cast<double>(area);
+      region.centroid_y = static_cast<double>(sum_y) / static_cast<double>(area);
+
+      // Copy the bounding box pixels from the source image (the source is left untouched)
+      region.crop = Bitmap(region.width, region.height);
+      for (std::int32_t cy = 0; cy < region.height; ++cy)
+        for (std::int32_t cx = 0; cx < region.width; ++cx)
+          region.crop.set(cx, cy, m_pixels[IX(min_x + cx, min_y + cy)]);
+
+      regions.push_back(std::move(region));
+    }
+
+    return regions;
+  }
 }
